@@ -870,6 +870,7 @@
               <option value="2">普通 · 铁甲老兵</option>
               <option value="3" selected>困难 · 沙场名将</option>
               <option value="4">大师 · 集团统帅</option>
+              <option value="5">地狱 · 炼狱战神</option>
             </select>
           </div>
 
@@ -882,6 +883,7 @@
               <option value="2" selected>普通 · 铁甲老兵</option>
               <option value="3">困难 · 沙场名将</option>
               <option value="4">大师 · 集团统帅</option>
+              <option value="5">地狱 · 炼狱战神</option>
             </select>
           </div>
 
@@ -894,6 +896,7 @@
               <option value="2">普通 · 铁甲老兵</option>
               <option value="3" selected>困难 · 沙场名将</option>
               <option value="4">大师 · 集团统帅</option>
+              <option value="5">地狱 · 炼狱战神</option>
             </select>
           </div>
 
@@ -1109,6 +1112,10 @@
           <li><strong>行营（每方 5 个）：</strong>进入行营的棋子免受任何攻击，每营仅容一子。</li>
           <li><strong>大本营（每方 2 个）：</strong>军旗必居其一；进入或初始位于大本营的棋子永不可动。</li>
         </ul>
+      </div>
+      <div>
+        <h4>地狱模式 · 炼狱战神</h4>
+        <p>在左侧三方 AI 难度中选择「地狱」：比较候选棋步与对手下一步全部合法应对，重点防范铁路反吃、亏子与失旗风险。暗棋仍按公开信息推断，难度越高也不会偷看未知棋子。</p>
       </div>
       <div>
         <h4>三 · 布阵铁律</h4>
@@ -2194,8 +2201,8 @@
         let score = 0;
 
         // Small random jitter depending on difficulty (Easy has high variance, Master has tiny variance)
-        const noiseMap = { 1: 160, 2: 75, 3: 25, 4: 8 };
-        score += (Math.random() - 0.5) * (noiseMap[difficulty] || 30);
+        const noiseMap = { 1: 160, 2: 75, 3: 25, 4: 8, 5: 0 };
+        score += (Math.random() - 0.5) * (noiseMap[difficulty] ?? 30);
 
         // 1. Leaving a SafeCamp (行营) is slightly penalized unless making a good capture
         if (fromNode.isSafeCamp) score -= 38;
@@ -2253,7 +2260,7 @@
             } else {
               // Active combat against moved or front/mid-row pieces
               const outcome = resolveCombat(piece, target);
-              if (difficulty === 4) {
+              if (difficulty >= 4) {
                 // Master AI evaluates public observations or neutral estimates
                 if (outcome === 'WIN') {
                   score += target.score * 1.15;
@@ -2336,7 +2343,7 @@
               const adjP = observeEnemyPiece(state.board.get(nk));
               if (adjP && !areAllies(camp, adjP.camp) && adjP.movable && !nodes.get(nk).isHQ) {
                 if (adjP.rank > piece.rank || adjP.code === 'BOMB') {
-                  score -= difficulty === 4 ? piece.score * 0.55 : piece.score * 0.3;
+                  score -= difficulty >= 4 ? piece.score * 0.55 : piece.score * 0.3;
                 }
               }
             }
@@ -2360,7 +2367,81 @@
         return score;
       }
 
+      // Bounded two-ply search. All unknown opponents are replaced by observations
+      // before simulation, so increasing difficulty never exposes hidden identities.
+      function chooseHellMove(camp) {
+        const realBoard = state.board;
+        const realAlive = state.aliveCamps;
+        const observedBoard = new Map();
+        for (const [k, p] of realBoard) {
+          observedBoard.set(k, areAllies(camp, p.camp) ? p : observeEnemyPiece(p));
+        }
+        function material() {
+          let value = 0;
+          for (const p of state.board.values()) {
+            const worth = p.code === 'FLAG' ? 16000 : p.score;
+            value += areAllies(camp, p.camp) ? worth : -worth;
+          }
+          return value;
+        }
+        function simulate(move) {
+          const attacker = state.board.get(move.fromKey);
+          const defender = state.board.get(move.toKey);
+          const outcome = defender ? resolveCombat(attacker, defender) : 'WIN';
+          state.board.delete(move.fromKey);
+          if (outcome === 'WIN') state.board.set(move.toKey, { ...attacker, hasMoved: true });
+          else if (outcome === 'BOTH_DIE') state.board.delete(move.toKey);
+          if (defender && defender.code === 'FLAG' && outcome !== 'LOSE') {
+            state.aliveCamps[defender.camp] = false;
+            for (const [k, p] of state.board) if (p.camp === defender.camp) state.board.delete(k);
+          }
+        }
+        try {
+          state.board = observedBoard;
+          state.aliveCamps = realAlive.slice();
+          const baseline = material();
+          const candidates = getAllMovesForCamp(camp).map(move => ({
+            move, score: evaluateMoveForAI(move, camp, 5)
+          })).sort((a, b) => b.score - a.score).slice(0, 16);
+          let chosen = null;
+          let bestScore = -Infinity;
+          for (const candidate of candidates) {
+            state.board = new Map(observedBoard);
+            state.aliveCamps = realAlive.slice();
+            simulate(candidate.move);
+            const afterMove = state.board;
+            const afterAlive = state.aliveCamps;
+            let replyCamp = camp;
+            for (let step = 1; step <= 4; step++) {
+              const c = (camp + step) % 4;
+              if (state.aliveCamps[c]) { replyCamp = c; break; }
+            }
+            const friendlyReply = areAllies(camp, replyCamp);
+            const replies = getAllMovesForCamp(replyCamp);
+            let responseValue = material() - baseline;
+            if (replies.length) {
+              responseValue = friendlyReply ? -Infinity : Infinity;
+              // Examine every legal reply, including long railway counterattacks.
+              for (const reply of replies) {
+                state.board = new Map(afterMove);
+                state.aliveCamps = afterAlive.slice();
+                simulate(reply);
+                const value = material() - baseline;
+                responseValue = friendlyReply ? Math.max(responseValue, value) : Math.min(responseValue, value);
+              }
+            }
+            const score = candidate.score * 0.35 + responseValue * 1.25;
+            if (score > bestScore) { bestScore = score; chosen = candidate.move; }
+          }
+          return chosen;
+        } finally {
+          state.board = realBoard;
+          state.aliveCamps = realAlive;
+        }
+      }
+
       function chooseBestMoveForCamp(camp, difficulty) {
+        if (difficulty === 5) return chooseHellMove(camp);
         const moves = getAllMovesForCamp(camp);
         if (moves.length === 0) return null;
 
@@ -2800,7 +2881,7 @@
       }
 
       function drawCornerQuadrantInfo(size) {
-        const diffNames = { 1: '新兵', 2: '老兵', 3: '名将', 4: '统帅' };
+        const diffNames = { 1: '新兵', 2: '老兵', 3: '名将', 4: '统帅', 5: '炼狱战神' };
         const corners = [
           { r: 2.5, c: 2.5, camp: CAMP_WEST, seal: '西' },
           { r: 2.5, c: 13.5, camp: CAMP_NORTH, seal: '北' },
