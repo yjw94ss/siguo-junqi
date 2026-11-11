@@ -1703,7 +1703,10 @@
         hintMove: null, // { fromKey, toKey }
         combatEffect: null, // { key, label, timestamp }
         tagTargetKey: null,
-        aiTimer: null
+        aiTimer: null,
+        aiHistory: [],
+        aiVisits: new Map(),
+        quietTurns: [0, 0, 0, 0]
       };
 
       let nextPieceUid = 1;
@@ -1760,6 +1763,9 @@
         state.lastMove = null;
         state.hintMove = null;
         state.combatEffect = null;
+        state.aiHistory = [];
+        state.aiVisits = new Map();
+        state.quietTurns = [0, 0, 0, 0];
 
         // Deploy South with chosen preset, and AI camps with varied tactical presets
         applyFormationToCamp(CAMP_SOUTH, createFormationFromPreset(southPreset));
@@ -2128,6 +2134,14 @@
           }
         }
 
+        // Record real turns only; hypothetical search must never update memory.
+        state.quietTurns[attacker.camp] = defender ? 0 : state.quietTurns[attacker.camp] + 1;
+        const visitKey = `${attacker.uid}:${toKey}`;
+        state.aiVisits.set(visitKey, (state.aiVisits.get(visitKey) || 0) + 1);
+        state.aiHistory.push({ camp: attacker.camp, uid: attacker.uid, from: fromKey, to: toKey,
+          position: aiPositionKey(state.board) });
+        if (state.aiHistory.length > 80) state.aiHistory.shift();
+
         state.lastMove = {
           fromKey,
           toKey,
@@ -2188,8 +2202,63 @@
         const meta = piece.knownSapper
           ? PIECE_TYPES.R32
           : { code: 'UNKNOWN', name: '未知棋子', rank: 35, score: 240, movable: true };
-        return { camp: piece.camp, hasMoved: piece.hasMoved, knownSapper: piece.knownSapper,
+        return { uid: piece.uid, camp: piece.camp, hasMoved: piece.hasMoved, knownSapper: piece.knownSapper,
           revealedToAll: false, ...meta };
+      }
+
+      function aiPositionKey(board) {
+        return [...board].map(([k, p]) => `${k}:${p.uid}`).sort().join('|');
+      }
+
+      // Unoccupied topology distances count a whole straight railway as one turn.
+      // This avoids the old Manhattan estimate, which ignored railway shortcuts.
+      const aiRouteCache = new Map();
+      function aiRouteDistances(camp, sapper) {
+        const goals = [];
+        for (let ec = 0; ec < 4; ec++) {
+          if (!state.aliveCamps[ec] || areAllies(camp, ec)) continue;
+          const revealedFlag = [...state.board].find(([k, p]) => p.camp === ec && p.code === 'FLAG' && p.revealedToAll);
+          if (revealedFlag) goals.push(revealedFlag[0]);
+          else for (const col of [1, 3]) { const g = localToGlobal(ec, 5, col); goals.push(keyOf(g.r, g.c)); }
+        }
+        const cacheKey = `${sapper}:${goals.sort().join(';')}`;
+        if (aiRouteCache.has(cacheKey)) return aiRouteCache.get(cacheKey);
+        const distances = new Map(goals.map(k => [k, 0]));
+        const queue = goals.slice();
+        for (let i = 0; i < queue.length; i++) {
+          const k = queue[i];
+          const neighbors = new Set(roadEdges.get(k));
+          if (sapper) for (const n of railAdj.get(k)) neighbors.add(n);
+          else for (const seg of railSegments) if (seg.includes(k)) for (const n of seg) neighbors.add(n);
+          for (const n of neighbors) {
+            if (distances.has(n)) continue;
+            distances.set(n, distances.get(k) + 1);
+            // Headquarters can be entered, but never used as a transit square.
+            if (!nodes.get(n).isHQ) queue.push(n);
+          }
+        }
+        // Sapper railway components can be traversed in one turn regardless of bends.
+        if (sapper) {
+          // Repeat relaxation until mixed road/rail paths have settled.
+          let changed = true;
+          while (changed) {
+            changed = false;
+            for (const [k, node] of nodes) {
+              if (!node.isRail) continue;
+              const seen = new Set([k]), railQueue = [k];
+              for (let j = 0; j < railQueue.length; j++) for (const n of railAdj.get(railQueue[j])) if (!seen.has(n)) {seen.add(n);railQueue.push(n);}
+              const best = Math.min(...railQueue.map(n => distances.get(n) ?? 99)) + 1;
+              if (best < (distances.get(k) ?? 99)) { distances.set(k, best); changed = true; }
+            }
+            for (const [k, neighbors] of roadEdges) if (!nodes.get(k).isHQ) for (const n of neighbors) {
+              const d = (distances.get(n) ?? 99) + 1;
+              if (d < (distances.get(k) ?? 99)) {distances.set(k, d);changed = true;}
+            }
+          }
+        }
+        if (aiRouteCache.size > 64) aiRouteCache.clear();
+        aiRouteCache.set(cacheKey, distances);
+        return distances;
       }
 
       // Estimate target enemy piece score & threat based on difficulty level
@@ -2204,11 +2273,21 @@
         const noiseMap = { 1: 160, 2: 75, 3: 25, 4: 8, 5: 0 };
         score += (Math.random() - 0.5) * (noiseMap[difficulty] ?? 30);
 
-        // 1. Leaving a SafeCamp (行营) is slightly penalized unless making a good capture
-        if (fromNode.isSafeCamp) score -= 38;
-        // Entering a SafeCamp (行营) is strongly rewarded for high-value pieces!
-        if (toNode.isSafeCamp) {
-          score += 55 + (piece.rank >= 37 ? 45 : 15);
+        // Shelter is a positional value, not a fresh reward on every arrival.
+        const shelter = piece.code === 'BOMB' ? 80 : piece.rank >= 37 ? 45 : 25;
+        score += ((toNode.isSafeCamp ? 1 : 0) - (fromNode.isSafeCamp ? 1 : 0)) * shelter;
+        if (!isCapture) {
+          const history = state.aiHistory.filter(h => h.camp === camp);
+          const last = history[history.length - 1];
+          if (last && last.uid === piece.uid && last.from === toKey && last.to === fromKey) score -= 160;
+          const visits = history.filter(h => h.uid === piece.uid && h.to === toKey).length;
+          score -= visits * 65;
+          // Lifetime visit counts also stop longer loops after the recent window expires.
+          score -= (state.aiVisits.get(`${piece.uid}:${toKey}`) || 0) * 55;
+          const nextBoard = new Map(state.board);
+          nextBoard.delete(fromKey); nextBoard.set(toKey, piece);
+          const position = aiPositionKey(nextBoard);
+          score -= state.aiHistory.filter(h => h.position === position).length * 220;
         }
 
         // Never move into own/ally empty HQ unless desperate, because pieces entering HQ get permanently frozen!
@@ -2302,39 +2381,11 @@
         } else {
           // 3. Non-Capture Positional Movement
           // Advance toward enemy camps (especially enemy HQs)
-          let minEnemyHQDist = 99;
-          for (let ec = 0; ec < 4; ec++) {
-            if (!state.aliveCamps[ec] || areAllies(camp, ec)) continue;
-            const hq1 = localToGlobal(ec, 5, 1);
-            const hq2 = localToGlobal(ec, 5, 3);
-            const d1 = Math.abs(toNode.r - hq1.r) + Math.abs(toNode.c - hq1.c);
-            const d2 = Math.abs(toNode.r - hq2.r) + Math.abs(toNode.c - hq2.c);
-            minEnemyHQDist = Math.min(minEnemyHQDist, d1, d2);
-          }
-          const prevDist = (() => {
-            let md = 99;
-            for (let ec = 0; ec < 4; ec++) {
-              if (!state.aliveCamps[ec] || areAllies(camp, ec)) continue;
-              const hq1 = localToGlobal(ec, 5, 1);
-              const hq2 = localToGlobal(ec, 5, 3);
-              const d1 = Math.abs(fromNode.r - hq1.r) + Math.abs(fromNode.c - hq1.c);
-              const d2 = Math.abs(fromNode.r - hq2.r) + Math.abs(fromNode.c - hq2.c);
-              md = Math.min(md, d1, d2);
-            }
-            return md;
-          })();
-
-          const progress = prevDist - minEnemyHQDist;
-          if (piece.code === 'R32') {
-            // Sappers love seizing railways
-            if (toNode.isRail) score += 35 + progress * 14;
-          } else if (piece.code === 'BOMB') {
-            // Keep bombs sheltered in SafeCamps or railway ambush points
-            if (toNode.isSafeCamp) score += 85;
-            else score += progress * 8;
-          } else {
-            score += progress * 16;
-          }
+          const distances = aiRouteDistances(camp, piece.code === 'R32');
+          const progress = (distances.get(fromKey) ?? 99) - (distances.get(toKey) ?? 99);
+          score += progress * (piece.code === 'BOMB' ? 28 : 48);
+          // A level move must serve a purpose after several quiet turns.
+          if (progress <= 0) score -= Math.min(8, state.quietTurns[camp]) * 9;
 
           // Difficulty 3 & 4: Check if destination square is immediately exposed to a stronger adjacent enemy!
           if (difficulty >= 3 && !toNode.isSafeCamp) {
@@ -2348,6 +2399,12 @@
               }
             }
           }
+        }
+
+        // Break information stalemates with inexpensive scouts rather than endlessly
+        // treating every unknown piece as a certain loss against a fixed rank.
+        if (isCapture && target && target.code === 'UNKNOWN' && piece.rank <= 35 && piece.code !== 'BOMB') {
+          score += Math.max(0, Math.min(16, state.quietTurns[camp] - 5)) * piece.score * 0.55;
         }
 
         // 4. Protect Own & Ally Flag if an enemy is deep inside our camp (lr >= 3)!
